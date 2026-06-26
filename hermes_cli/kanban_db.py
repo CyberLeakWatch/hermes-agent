@@ -183,7 +183,7 @@ def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
 
 # Grace period after a task transitions to ``running`` during which
 # ``detect_crashed_workers`` skips the ``_pid_alive`` check. Covers the
-# fork() → /proc-visibility window where liveness can transiently report
+# fork() -> /proc-visibility window where liveness can transiently report
 # False for a freshly-spawned worker. The 15-minute claim TTL still
 # catches genuinely-crashed workers; this only suppresses false positives
 # during the launch window.
@@ -448,13 +448,13 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     Resolution (highest precedence first):
 
     1. ``HERMES_KANBAN_DB`` env var — pins the path directly. Honoured for
-       back-compat and for the dispatcher→worker handoff (defense in
+       back-compat and for the dispatcher->worker handoff (defense in
        depth: dispatcher injects this into worker env so workers are
        immune to any path-resolution disagreement).
     2. When ``board`` arg is None, the active board from
        :func:`get_current_board` is used.
-    3. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
-       Other boards → ``<root>/kanban/boards/<slug>/kanban.db``.
+    3. Board ``default`` -> ``<root>/kanban.db`` (back-compat path).
+       Other boards -> ``<root>/kanban/boards/<slug>/kanban.db``.
     """
     override = os.environ.get("HERMES_KANBAN_DB", "").strip()
     if override:
@@ -554,7 +554,7 @@ def board_metadata_path(board: Optional[str] = None) -> Path:
 def _default_board_display_name(slug: str) -> str:
     """Turn a slug into a reasonable default display name.
 
-    ``atm10-server`` → ``Atm10 Server``. Users can override via
+    ``atm10-server`` -> ``Atm10 Server``. Users can override via
     ``board.json`` but the default should look presentable in the
     dashboard without any follow-up editing.
     """
@@ -823,7 +823,7 @@ class Task:
     # against this card's title/body (treated as the goal). If the judge
     # says "not done" and budget remains, the worker is fed a
     # continuation prompt IN THE SAME SESSION and keeps working until the
-    # judge agrees, the goal-turn budget is exhausted (→ kanban_block),
+    # judge agrees, the goal-turn budget is exhausted (-> kanban_block),
     # or the worker explicitly blocks/completes. ``False`` (default) =
     # the classic single-shot worker. ``goal_max_turns`` bounds the loop.
     goal_mode: bool = False
@@ -836,6 +836,12 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    # Independent auditor profile assigned when the editor requests review.
+    # NULL when no audit has been requested, or when the task uses the
+    # default dispatcher-driven review flow (which keys off ``assignee``
+    # alone). When set, ``poll_tasks(role='auditor')`` surfaces this task
+    # to the named profile, and ``claim_audit()`` records the claim.
+    auditor: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -910,6 +916,9 @@ class Task:
             ),
             session_id=(
                 row["session_id"] if "session_id" in keys else None
+            ),
+            auditor=(
+                row["auditor"] if "auditor" in keys else None
             ),
         )
 
@@ -1071,7 +1080,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- for tasks created from the CLI, dashboard, or any path that doesn't
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
-    session_id           TEXT
+    session_id           TEXT,
+    -- Independent auditor profile for multi-agent editor->auditor workflows.
+    -- NULL when no audit has been requested. Set by ``request_review()``.
+    auditor              TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1591,11 +1603,11 @@ def connect(
 
     Path resolution:
 
-    * ``db_path`` explicit → used as-is (legacy callers, tests).
-    * ``board`` explicit → resolves to that board's DB.
-    * Neither → :func:`kanban_db_path` resolves via
-      ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
-      ``<root>/kanban/current`` → ``default``.
+    * ``db_path`` explicit -> used as-is (legacy callers, tests).
+    * ``board`` explicit -> resolves to that board's DB.
+    * Neither -> :func:`kanban_db_path` resolves via
+      ``HERMES_KANBAN_DB`` env -> ``HERMES_KANBAN_BOARD`` env ->
+      ``<root>/kanban/current`` -> ``default``.
     """
     if db_path is not None:
         path = db_path
@@ -1791,8 +1803,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # below is truly idempotent and never re-adds columns that already exist.
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
 
-    # Legacy column migration: ``spawn_failures`` → ``consecutive_failures``
-    # and ``last_spawn_error`` → ``last_failure_error``.
+    # Legacy column migration: ``spawn_failures`` -> ``consecutive_failures``
+    # and ``last_spawn_error`` -> ``last_failure_error``.
     #
     # Avoid ``ALTER TABLE ... RENAME COLUMN`` for two reasons:
     #   1. Primary: very old DBs may never have had ``spawn_failures`` at
@@ -1883,6 +1895,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
+    if "auditor" not in cols:
+        # Independent auditor profile for multi-agent editor->auditor
+        # workflows. NULL on legacy rows. Set by ``request_review()``.
+        _add_column_if_missing(
+            conn, "tasks", "auditor", "auditor TEXT"
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -1896,6 +1915,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_auditor ON tasks(auditor)"
     )
 
     # task_events gained a run_id column; back-fill it as NULL for
@@ -2075,8 +2097,8 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
     Old boards crash the gateway notifier (``int(None)`` on a NULL id in
     ``unseen_events_for_sub``) and never match the ``id > cursor`` filter, so
     every kanban notification is silently lost (#35096). Each affected table is
-    rebuilt with the standard SQLite pattern — CREATE new → INSERT shared
-    columns → DROP old → RENAME — recreating its indexes too (DROP TABLE takes
+    rebuilt with the standard SQLite pattern — CREATE new -> INSERT shared
+    columns -> DROP old -> RENAME — recreating its indexes too (DROP TABLE takes
     them down). The legacy TEXT ids are dropped (they aren't valid integers);
     AUTOINCREMENT assigns fresh ones and ``last_event_id`` cursors reset to 0,
     so the first post-migration tick replays a task's event history once —
@@ -2101,7 +2123,7 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
             conn.execute(create_sql)
             new_cols = {c["name"] for c in conn.execute(f"PRAGMA table_info({table})")}
             if table == "kanban_notify_subs":
-                # Cast the legacy TEXT cursor to INTEGER; NULL / non-numeric → 0.
+                # Cast the legacy TEXT cursor to INTEGER; NULL / non-numeric -> 0.
                 shared = [c for c in old_cols if c in new_cols and c != "last_event_id"]
                 cols_csv = ", ".join(shared)
                 conn.execute(
@@ -3127,8 +3149,8 @@ def recompute_ready(
                     # circuit-breaker failure limit.  Without this
                     # guard, a task that repeatedly exhausts its
                     # iteration budget would cycle forever:
-                    # block → auto-recover → respawn → budget
-                    # exhausted → block → …  The counter must also
+                    # block -> auto-recover -> respawn -> budget
+                    # exhausted -> block -> …  The counter must also
                     # be preserved so the breaker can accumulate
                     # across recovery cycles.
                     failures = int(row["consecutive_failures"] or 0)
@@ -3353,6 +3375,298 @@ def claim_review_task(
             run_id=run_id,
         )
         return get_task(conn, task_id)
+
+
+
+def _coerce_review_flag(value: Any) -> bool:
+    """Return True for permissive truthy values used in metadata gates."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+
+def _coerce_optional_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def review_request_from_metadata(
+    metadata: Optional[dict],
+    *,
+    summary: Optional[str] = None,
+    result: Optional[str] = None,
+) -> Optional[dict[str, Optional[str]]]:
+    """Return review-routing data when completion metadata requests audit.
+
+    Worker completions may attach ``{"needs_audit": true}`` to request an
+    editor -> auditor handoff instead of a direct terminal ``done`` transition.
+    Optional knobs:
+
+    - ``audit_profile`` / ``review_auditor``: named auditor profile.
+    - ``audit_reason`` / ``review_reason``: short reason shown to the auditor.
+
+    When no explicit reason is present we fall back to the completion handoff
+    text (``summary`` first, then ``result``).
+    """
+    if not isinstance(metadata, dict):
+        return None
+    if not _coerce_review_flag(metadata.get("needs_audit")):
+        return None
+    auditor = _coerce_optional_text(metadata.get("review_auditor"))
+    if auditor is None:
+        auditor = _coerce_optional_text(metadata.get("audit_profile"))
+    reason = _coerce_optional_text(metadata.get("review_reason"))
+    if reason is None:
+        reason = _coerce_optional_text(metadata.get("audit_reason"))
+    if reason is None:
+        reason = _coerce_optional_text(summary if summary is not None else result)
+    return {"auditor": auditor, "reason": reason}
+
+def request_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    auditor: Optional[str] = None,
+    reason: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    verified_cards: Optional[Iterable[str]] = None,
+) -> bool:
+    """Transition ``running -> review`` and optionally assign an auditor.
+
+    This is the editor->auditor handoff: the worker who owns the task
+    signals that the work is ready for independent audit. The task moves
+    to ``review`` status, the current run is closed, and ``auditor`` is
+    set to the named profile (or cleared if ``auditor`` is None, leaving
+    the dispatcher's default review-spawn logic to pick it up).
+
+    Returns ``True`` on success, ``False`` if the task was not in
+    ``running`` status (or the expected_run_id guard failed).
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        if expected_run_id is None:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status       = 'review',
+                       auditor      = ?,
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL
+                 WHERE id = ?
+                   AND status = 'running'
+                """,
+                (auditor, task_id),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status       = 'review',
+                       auditor      = ?,
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL
+                 WHERE id = ?
+                   AND status = 'running'
+                   AND current_run_id = ?
+                """,
+                (auditor, task_id, int(expected_run_id)),
+            )
+        if cur.rowcount != 1:
+            return False
+        review_summary = summary if summary is not None else reason
+        run_id = _end_run(
+            conn, task_id,
+            outcome="review_requested", status="review",
+            summary=review_summary,
+            metadata=metadata,
+        )
+        review_payload: dict[str, Any] = {"auditor": auditor, "reason": reason}
+        if verified_cards:
+            review_payload["verified_cards"] = [
+                str(card).strip() for card in verified_cards if str(card).strip()
+            ]
+        if review_summary and review_summary != reason:
+            review_payload["summary"] = review_summary.strip().splitlines()[0][:400]
+        _append_event(
+            conn, task_id, "review_requested",
+            review_payload,
+            run_id=run_id,
+        )
+        _reviewed_task = get_task(conn, task_id)
+    _fire_kanban_lifecycle_hook(
+        "kanban_task_review_requested",
+        task_id,
+        board=get_current_board(),
+        assignee=_reviewed_task.assignee if _reviewed_task else None,
+        auditor=auditor,
+        run_id=run_id,
+        reason=reason,
+        summary=summary if summary is not None else reason,
+    )
+    return True
+
+
+def claim_audit(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    ttl_seconds: Optional[int] = None,
+    claimer: Optional[str] = None,
+) -> Optional[Task]:
+    """Atomically claim the auditor role for a task in ``review``.
+
+    Unlike :func:`claim_review_task` (which transitions ``review ->
+    running`` and is used by the dispatcher), this function records the
+    auditor's claim on the task **without** changing the status away from
+    ``review``. It sets ``claim_lock`` so a concurrent auditor cannot
+    also claim, and creates a new run entry for the audit lifecycle.
+
+    Returns the claimed ``Task`` on success, ``None`` if the task was
+    already claimed (or is not in ``review`` status).
+    """
+    now = int(time.time())
+    lock = claimer or _claimer_id()
+    expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET claim_lock    = ?,
+                   claim_expires = ?,
+                   started_at    = COALESCE(started_at, ?)
+             WHERE id = ?
+               AND status = 'review'
+               AND claim_lock IS NULL
+            """,
+            (lock, expires, now, task_id),
+        )
+        if cur.rowcount != 1:
+            return None
+        trow = conn.execute(
+            "SELECT assignee, auditor, max_runtime_seconds, current_step_key "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        run_cur = conn.execute(
+            """
+            INSERT INTO task_runs (
+                task_id, profile, step_key, status,
+                claim_lock, claim_expires, max_runtime_seconds,
+                started_at
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                trow["auditor"] if trow and trow["auditor"] else (
+                    trow["assignee"] if trow else None
+                ),
+                trow["current_step_key"] if trow else None,
+                lock,
+                expires,
+                trow["max_runtime_seconds"] if trow else None,
+                now,
+            ),
+        )
+        run_id = run_cur.lastrowid
+        conn.execute(
+            "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+            (run_id, task_id),
+        )
+        _append_event(
+            conn, task_id, "audit_claimed",
+            {"lock": lock, "expires": expires, "run_id": run_id,
+             "auditor": trow["auditor"] if trow else None},
+            run_id=run_id,
+        )
+        return get_task(conn, task_id)
+
+
+def poll_tasks(
+    conn: sqlite3.Connection,
+    *,
+    role: str = "editor",
+    profile: Optional[str] = None,
+    limit: int = 50,
+) -> list[dict]:
+    """List tasks available for a given role (editor or auditor).
+
+    ``role='editor'``: tasks in ``ready`` with no claim lock, ordered by
+    priority then creation time. These are tasks waiting for an editor to
+    pick up.
+
+    ``role='auditor'``: tasks in ``review`` with no claim lock. If
+    ``profile`` is given, only tasks where ``auditor IS NULL`` (unassigned
+    audit, first-take) or ``auditor = profile`` (assigned to this auditor)
+    are returned. If ``profile`` is None, all unclaimed review tasks are
+    returned.
+
+    Returns a list of dicts with: id, title, status, assignee, auditor,
+    priority, created_at.
+    """
+    if role == "editor":
+        rows = conn.execute(
+            """
+            SELECT id, title, status, assignee, auditor, priority, created_at
+              FROM tasks
+             WHERE status = 'ready'
+               AND claim_lock IS NULL
+             ORDER BY priority DESC, created_at ASC
+             LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    elif role == "auditor":
+        if profile:
+            rows = conn.execute(
+                """
+                SELECT id, title, status, assignee, auditor, priority, created_at
+                  FROM tasks
+                 WHERE status = 'review'
+                   AND claim_lock IS NULL
+                   AND (auditor IS NULL OR auditor = ?)
+                 ORDER BY priority DESC, created_at ASC
+                 LIMIT ?
+                """,
+                (profile, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, title, status, assignee, auditor, priority, created_at
+                  FROM tasks
+                 WHERE status = 'review'
+                   AND claim_lock IS NULL
+                 ORDER BY priority DESC, created_at ASC
+                 LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+    else:
+        raise ValueError(
+            f"role must be 'editor' or 'auditor', got {role!r}"
+        )
+    return [
+        {
+            "id": r["id"],
+            "title": r["title"],
+            "status": r["status"],
+            "assignee": r["assignee"],
+            "auditor": r["auditor"] if "auditor" in dict(r) else None,
+            "priority": r["priority"],
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
 
 
 def heartbeat_claim(
@@ -3831,6 +4145,24 @@ def complete_task(
     else:
         verified_cards = []
 
+    review_request = review_request_from_metadata(
+        metadata,
+        summary=summary,
+        result=result,
+    )
+    if review_request and request_review(
+        conn,
+        task_id,
+        auditor=review_request["auditor"],
+        reason=review_request["reason"],
+        expected_run_id=expected_run_id,
+        summary=summary if summary is not None else result,
+        metadata=metadata,
+        verified_cards=verified_cards,
+    ):
+        _clear_failure_counter(conn, task_id)
+        return True
+
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -3872,7 +4204,7 @@ def complete_task(
             metadata=metadata,
         )
         # If complete_task was called on a never-claimed task (ready or
-        # blocked → done with no run in flight), synthesize a
+        # blocked -> done with no run in flight), synthesize a
         # zero-duration run so the handoff fields are persisted in
         # attempt history instead of silently lost.
         if run_id is None and (summary or metadata or result):
@@ -5500,19 +5832,19 @@ def _pid_alive(pid: Optional[int]) -> bool:
     from gateway.status import _pid_exists
     if not _pid_exists(int(pid)):
         return False
-    # Still here → process exists. Check for zombie on platforms
+    # Still here -> process exists. Check for zombie on platforms
     # where we have a cheap, deterministic process-state probe.
     if sys.platform == "linux":
         try:
             with open(f"/proc/{int(pid)}/status", "r", encoding="utf-8") as f:
                 for line in f:
                     if line.startswith("State:"):
-                        # "State:\tZ (zombie)" → dead
+                        # "State:\tZ (zombie)" -> dead
                         if "Z" in line.split(":", 1)[1]:
                             return False
                         break
         except (FileNotFoundError, PermissionError, OSError):
-            # proc entry gone → already reaped; treat as dead.
+            # proc entry gone -> already reaped; treat as dead.
             # PermissionError shouldn't happen for our own children but
             # be defensive.
             pass
@@ -5805,7 +6137,7 @@ def enforce_max_runtime(
                 timed_out.append(tid)
         # Increment the unified failure counter. Outside the write_txn
         # above because ``_record_task_failure`` opens its own. If the
-        # breaker trips, this flips the task ``ready → blocked`` and
+        # breaker trips, this flips the task ``ready -> blocked`` and
         # emits a ``gave_up`` event on top of the ``timed_out`` we
         # already emitted.
         if cur.rowcount == 1:
@@ -5883,7 +6215,7 @@ def detect_stale_running(
         last_hb = row["last_heartbeat_at"]
         hb_age = (now - int(last_hb)) if last_hb is not None else None
         if hb_age is not None and hb_age < _STALE_HEARTBEAT_GAP_SECONDS:
-            continue  # recent heartbeat → still alive
+            continue  # recent heartbeat -> still alive
 
         pid = row["worker_pid"]
         tid = row["id"]
@@ -6121,7 +6453,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     )
     # Outside the main txn: increment the unified failure counter for
     # each crashed task. If the breaker trips, the task transitions
-    # ready → blocked with a ``gave_up`` event on top of the ``crashed``
+    # ready -> blocked with a ``gave_up`` event on top of the ``crashed``
     # event we already emitted.
     #
     # Protocol-violation crashes force an immediate trip (failure_limit=1)
@@ -6197,7 +6529,7 @@ def _record_task_failure(
       Caller has ALREADY flipped the task to ``ready`` and closed the
       run with the appropriate outcome. This just increments the
       counter; if the breaker trips, the task is re-transitioned
-      ``ready → blocked`` and a ``gave_up`` event is emitted.
+      ``ready -> blocked`` and a ``gave_up`` event is emitted.
 
     ``event_payload_extra`` merges into the ``gave_up`` event payload
     when the breaker trips, so callers can include outcome-specific
@@ -6285,7 +6617,7 @@ def _record_task_failure(
         else:
             # Below threshold.
             if release_claim:
-                # Spawn path: transition running → ready + clear claim.
+                # Spawn path: transition running -> ready + clear claim.
                 conn.execute(
                     "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
@@ -6438,7 +6770,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     #    (quota wall) — defer while inside the cooldown window, then allow a
     #    cheap probe. Must run BEFORE the blocker_auth regex check, because a
     #    rate-limit requeue stamps a quota-flavored last_failure_error that
-    #    the regex would otherwise match → defer forever (no failure counter
+    #    the regex would otherwise match -> defer forever (no failure counter
     #    increment on this path means the breaker can never free it).
     #
     #    We look at the LATEST run only (ORDER BY ended_at DESC LIMIT 1): if a
@@ -6745,7 +7077,7 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
-    # Normalize default_assignee once: empty/whitespace string → None so the
+    # Normalize default_assignee once: empty/whitespace string -> None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
     _default_assignee = (default_assignee or "").strip() or None
@@ -6941,8 +7273,8 @@ def _dispatch_once_locked(
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
     # creating a PR.  The dispatcher spawns a review agent (loading
-    # sdlc-review skill) that verifies the PR and either merges (→ done)
-    # or rejects (→ back to running for the worker to fix).
+    # sdlc-review skill) that verifies the PR and either merges (-> done)
+    # or rejects (-> back to running for the worker to fix).
     #
     # Same concurrency model as ready dispatch: review spawns count
     # against max_spawn alongside ready tasks, so the total number of
@@ -7597,7 +7929,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             size_kb = max(1, (att.size + 1023) // 1024) if att.size else 0
             size_str = f", {size_kb} KB" if size_kb else ""
             ctype = f", {att.content_type}" if att.content_type else ""
-            lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
+            lines.append(f"- `{att.filename}`{ctype}{size_str} -> `{att.stored_path}`")
         lines.append("")
 
     # Prior attempts — show closed runs so a retrying worker sees the
@@ -8094,8 +8426,8 @@ def worker_log_path(task_id: str, *, board: Optional[str] = None) -> Path:
     """Return the path to a worker's log file. The file may not exist
     (task never spawned, or log already GC'd).
 
-    When ``board`` is None, resolves via the active board (env var →
-    current-board file → default). The dispatcher always passes the
+    When ``board`` is None, resolves via the active board (env var ->
+    current-board file -> default). The dispatcher always passes the
     board explicitly to avoid any resolution ambiguity when multiple
     boards exist."""
     return worker_logs_dir(board=board) / f"{task_id}.log"
@@ -8292,7 +8624,7 @@ def latest_summaries(
     Used by the dashboard board endpoint to attach ``latest_summary`` to
     every card in a single SQL query, avoiding the N+1 pattern of
     calling :func:`latest_summary` per task. Returns a dict mapping
-    ``task_id`` → summary string, omitting tasks with no summary.
+    ``task_id`` -> summary string, omitting tasks with no summary.
 
     Approach: a window function picks the newest non-null-summary row
     per ``task_id``; works against SQLite ≥ 3.25 (default on every

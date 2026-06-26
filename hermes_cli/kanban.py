@@ -508,6 +508,39 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_claim.add_argument("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS,
                          help="Claim TTL in seconds (default: 900)")
 
+    # --- review (editor to auditor handoff) / claim-audit / poll ---
+
+    p_review = sub.add_parser(
+        "review",
+        help="Request independent audit: transition running to review",
+    )
+    p_review.add_argument("task_id")
+    p_review.add_argument("--auditor", default=None,
+                          help="Profile name of the designated auditor")
+    p_review.add_argument("--reason", default=None,
+                          help="Why review is requested (shown to auditor)")
+
+    p_claim_audit = sub.add_parser(
+        "claim-audit",
+        help="Atomically claim the auditor role for a review task",
+    )
+    p_claim_audit.add_argument("task_id")
+    p_claim_audit.add_argument("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS,
+                               help="Claim TTL in seconds (default: 900)")
+
+    p_poll = sub.add_parser(
+        "poll",
+        help="List tasks available for a role (editor or auditor)",
+    )
+    p_poll.add_argument("--role", choices=["editor", "auditor"],
+                        default="editor", help="Role to poll for (default: editor)")
+    p_poll.add_argument("--profile", default=None,
+                        help="Your profile name (for auditor filtering)")
+    p_poll.add_argument("--limit", type=int, default=50,
+                        help="Max tasks to list (default: 50)")
+    p_poll.add_argument("--json", action="store_true", dest="json_output",
+                        help="Output as JSON")
+
     # --- comment / complete / block / unblock / archive ---
     p_comment = sub.add_parser("comment", help="Append a comment")
     p_comment.add_argument("task_id")
@@ -844,6 +877,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_gc.add_argument("--log-retention-days", type=int, default=30,
                       help="Delete worker log files older than N days (default: 30)")
 
+    p_review.set_defaults(func=_cmd_review)
+    p_claim_audit.set_defaults(func=_cmd_claim_audit)
+    p_poll.set_defaults(func=_cmd_poll)
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -1819,6 +1855,79 @@ def _cmd_claim(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_review(args: argparse.Namespace) -> int:
+    """Request independent audit: transition running to review."""
+    auditor = args.auditor
+    if auditor:
+        auditor = auditor.strip() or None
+    reason = args.reason
+    with kb.connect_closing() as conn:
+        ok = kb.request_review(
+            conn, args.task_id,
+            auditor=auditor, reason=reason,
+        )
+    if not ok:
+        print(
+            f"cannot request review for {args.task_id}: "
+            f"task not in 'running' status",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Review requested for {args.task_id}")
+    if auditor:
+        print(f"Auditor: {auditor}")
+    if reason:
+        print(f"Reason: {reason}")
+    return 0
+
+
+def _cmd_claim_audit(args: argparse.Namespace) -> int:
+    """Atomically claim the auditor role for a task in review."""
+    with kb.connect_closing() as conn:
+        task = kb.claim_audit(conn, args.task_id, ttl_seconds=args.ttl)
+        if task is None:
+            existing = kb.get_task(conn, args.task_id)
+            if existing is None:
+                print(f"no such task: {args.task_id}", file=sys.stderr)
+                return 1
+            print(
+                f"cannot claim audit for {args.task_id}: "
+                f"status={existing.status} lock={existing.claim_lock or '(none)'}",
+                file=sys.stderr,
+            )
+            return 1
+    print(f"Audit claimed for {task.id}")
+    return 0
+
+
+def _cmd_poll(args: argparse.Namespace) -> int:
+    """List tasks available for a role."""
+    profile = args.profile or _profile_author()
+    with kb.connect_closing() as conn:
+        tasks = kb.poll_tasks(
+            conn,
+            role=args.role,
+            profile=profile if args.role == "auditor" else None,
+            limit=args.limit,
+        )
+    if args.json_output:
+        print(json.dumps(tasks, ensure_ascii=False, indent=2))
+        return 0
+    if not tasks:
+        print(f"No {args.role} tasks available.")
+        return 0
+    print(f"{'ID':<20} {'Status':<10} {'Pri':>3} {'Assignee':<15} {'Auditor':<15} Title")
+    print("-" * 90)
+    for t in tasks:
+        print(
+            f"{t['id']:<20} {t['status']:<10} {t['priority']:>3} "
+            f"{(t['assignee'] or '-'):<15} {(t['auditor'] or '-'):<15} "
+            f"{t['title'][:40]}"
+        )
+    print(f"\n{len(tasks)} task(s) available for role={args.role}")
+    return 0
+
+
 def _cmd_comment(args: argparse.Namespace) -> int:
     body = " ".join(args.text).strip()
     if args.max_len is not None:
@@ -1888,7 +1997,12 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
-                print(f"Completed {tid}")
+                task = kb.get_task(conn, tid)
+                if task is not None and task.status == "review":
+                    who = f" (auditor: {task.auditor})" if task.auditor else ""
+                    print(f"Requested review for {tid}{who}")
+                else:
+                    print(f"Completed {tid}")
     return 0 if not failed else 1
 
 
