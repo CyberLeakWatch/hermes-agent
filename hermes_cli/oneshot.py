@@ -332,6 +332,13 @@ def _run_agent(
     # honour the same merge semantics as interactive CLI and gateway sessions.
     _fb = get_fallback_chain(cfg)
 
+    # --- FIX: wait for background MCP discovery before tool snapshot ---
+    # Without this, slow MCP servers (osint/blockchain) are invisible in
+    # oneshot because their tools haven't registered when AIAgent takes
+    # its initial tool snapshot. thread.join() returns instantly if
+    # discovery already completed (fast servers pay no penalty).
+    from hermes_cli.mcp_startup import wait_for_mcp_discovery
+    wait_for_mcp_discovery()
     agent = AIAgent(
         api_key=runtime.get("api_key"),
         base_url=runtime.get("base_url"),
