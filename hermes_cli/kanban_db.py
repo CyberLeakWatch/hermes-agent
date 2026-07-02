@@ -907,6 +907,12 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    # Independent auditor profile assigned when the editor requests review.
+    # NULL when no audit has been requested, or when the task uses the
+    # default dispatcher-driven review flow (which keys off ``assignee``
+    # alone). When set, ``poll_tasks(role='auditor')`` surfaces this task
+    # to the named profile, and ``claim_audit()`` records the claim.
+    auditor: Optional[str] = None
     # Typed block reason (one of VALID_BLOCK_KINDS) or None for legacy/un-typed
     # blocks. Set by ``block_task``; preserved across unblock so a re-block for
     # the same kind is recognisable as an unblock↔re-block loop.
@@ -989,6 +995,9 @@ class Task:
             ),
             session_id=(
                 row["session_id"] if "session_id" in keys else None
+            ),
+            auditor=(
+                row["auditor"] if "auditor" in keys else None
             ),
             block_kind=(
                 row["block_kind"] if "block_kind" in keys and row["block_kind"] else None
@@ -1163,6 +1172,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
     session_id           TEXT,
+    -- Independent auditor profile for multi-agent editor->auditor workflows.
+    -- NULL when no audit has been requested. Set by ``request_review()``.
+    auditor              TEXT,
     -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
     -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
     -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
@@ -1867,6 +1879,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
         )
+    if "auditor" not in cols:
+        _add_column_if_missing(conn, "tasks", "auditor", "auditor TEXT")
     # ``idx_tasks_idempotency`` is created unconditionally below alongside
     # the other additive-column indexes — see the block after the
     # legacy-column migration. Creating it here too would be redundant.
@@ -3491,6 +3505,223 @@ def claim_task(
     return claimed
 
 
+def _coerce_review_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+
+def _coerce_optional_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def review_request_from_metadata(
+    metadata: Optional[dict],
+    *,
+    summary: Optional[str] = None,
+    result: Optional[str] = None,
+) -> Optional[dict[str, Optional[str]]]:
+    if not isinstance(metadata, dict):
+        return None
+    if not _coerce_review_flag(metadata.get("needs_audit")):
+        return None
+    auditor = _coerce_optional_text(metadata.get("review_auditor"))
+    if auditor is None:
+        auditor = _coerce_optional_text(metadata.get("audit_profile"))
+    reason = _coerce_optional_text(metadata.get("review_reason"))
+    if reason is None:
+        reason = _coerce_optional_text(metadata.get("audit_reason"))
+    if reason is None:
+        reason = _coerce_optional_text(summary if summary is not None else result)
+    return {"auditor": auditor, "reason": reason}
+
+
+def request_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    auditor: Optional[str] = None,
+    reason: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    verified_cards: Optional[Iterable[str]] = None,
+) -> bool:
+    with write_txn(conn):
+        if expected_run_id is None:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status       = 'review',
+                       auditor      = ?,
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL
+                 WHERE id = ?
+                   AND status = 'running'
+                """,
+                (auditor, task_id),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status       = 'review',
+                       auditor      = ?,
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL
+                 WHERE id = ?
+                   AND status = 'running'
+                   AND current_run_id = ?
+                """,
+                (auditor, task_id, int(expected_run_id)),
+            )
+        if cur.rowcount != 1:
+            return False
+        review_summary = summary if summary is not None else reason
+        run_id = _end_run(
+            conn, task_id,
+            outcome="review_requested", status="review",
+            summary=review_summary,
+            metadata=metadata,
+        )
+        review_payload: dict[str, Any] = {"auditor": auditor, "reason": reason}
+        if verified_cards:
+            review_payload["verified_cards"] = [
+                str(card).strip() for card in verified_cards if str(card).strip()
+            ]
+        if review_summary and review_summary != reason:
+            review_payload["summary"] = review_summary.strip().splitlines()[0][:400]
+        _append_event(conn, task_id, "review_requested", review_payload, run_id=run_id)
+        _reviewed_task = get_task(conn, task_id)
+    _fire_kanban_lifecycle_hook(
+        "kanban_task_review_requested",
+        task_id,
+        board=get_current_board(),
+        assignee=_reviewed_task.assignee if _reviewed_task else None,
+        auditor=auditor,
+        run_id=run_id,
+        reason=reason,
+        summary=summary if summary is not None else reason,
+    )
+    return True
+
+
+def claim_audit(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    ttl_seconds: Optional[int] = None,
+    claimer: Optional[str] = None,
+) -> Optional[Task]:
+    now = int(time.time())
+    lock = claimer or _claimer_id()
+    expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET claim_lock    = ?,
+                   claim_expires = ?,
+                   started_at    = COALESCE(started_at, ?)
+             WHERE id = ?
+               AND status = 'review'
+               AND claim_lock IS NULL
+            """,
+            (lock, expires, now, task_id),
+        )
+        if cur.rowcount != 1:
+            return None
+        trow = conn.execute(
+            "SELECT assignee, auditor, max_runtime_seconds, current_step_key FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        run_cur = conn.execute(
+            """
+            INSERT INTO task_runs (
+                task_id, profile, step_key, status,
+                claim_lock, claim_expires, max_runtime_seconds,
+                started_at
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                trow["auditor"] if trow and trow["auditor"] else (trow["assignee"] if trow else None),
+                trow["current_step_key"] if trow else None,
+                lock,
+                expires,
+                trow["max_runtime_seconds"] if trow else None,
+                now,
+            ),
+        )
+        run_id = run_cur.lastrowid
+        conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, task_id))
+        _append_event(
+            conn, task_id, "audit_claimed",
+            {"lock": lock, "expires": expires, "run_id": run_id, "auditor": trow["auditor"] if trow else None},
+            run_id=run_id,
+        )
+        return get_task(conn, task_id)
+
+
+def poll_tasks(
+    conn: sqlite3.Connection,
+    *,
+    role: str = "editor",
+    profile: Optional[str] = None,
+    limit: int = 50,
+) -> list[dict]:
+    if role == "editor":
+        rows = conn.execute(
+            """
+            SELECT id, title, status, assignee, auditor, priority, created_at
+              FROM tasks
+             WHERE status = 'ready'
+               AND claim_lock IS NULL
+             ORDER BY priority DESC, created_at ASC
+             LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    elif role == "auditor":
+        if profile:
+            rows = conn.execute(
+                """
+                SELECT id, title, status, assignee, auditor, priority, created_at
+                  FROM tasks
+                 WHERE status = 'review'
+                   AND claim_lock IS NULL
+                   AND (auditor IS NULL OR auditor = ?)
+                 ORDER BY priority DESC, created_at ASC
+                 LIMIT ?
+                """,
+                (profile, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, title, status, assignee, auditor, priority, created_at
+                  FROM tasks
+                 WHERE status = 'review'
+                   AND claim_lock IS NULL
+                 ORDER BY priority DESC, created_at ASC
+                 LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+    else:
+        raise ValueError("role must be 'editor' or 'auditor'")
+    return [dict(r) for r in rows]
+
+
 def claim_review_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4041,6 +4272,24 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    review_request = review_request_from_metadata(
+        metadata,
+        summary=summary,
+        result=result,
+    )
+    if review_request and request_review(
+        conn,
+        task_id,
+        auditor=review_request['auditor'],
+        reason=review_request['reason'],
+        expected_run_id=expected_run_id,
+        summary=summary if summary is not None else result,
+        metadata=metadata,
+        verified_cards=verified_cards,
+    ):
+        _clear_failure_counter(conn, task_id)
+        return True
 
     with write_txn(conn):
         if expected_run_id is None:

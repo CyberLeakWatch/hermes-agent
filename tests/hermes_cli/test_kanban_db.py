@@ -4766,3 +4766,61 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+def test_request_review_transitions_running_to_review(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="needs audit", assignee="alice")
+        _set_task_status(conn, t, "running")
+        assert kb.request_review(conn, t, auditor="bob", reason="double-check") is True
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "review"
+        assert getattr(task, "auditor", None) == "bob"
+
+
+def test_claim_audit_claims_review_without_leaving_review(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="audit me", assignee="alice")
+        _set_task_status(conn, t, "review")
+        conn.execute("UPDATE tasks SET auditor = ? WHERE id = ?", ("bob", t))
+        claimed = kb.claim_audit(conn, t)
+        assert claimed is not None
+        assert claimed.status == "review"
+        assert claimed.claim_lock is not None
+        assert getattr(claimed, "auditor", None) == "bob"
+
+
+def test_poll_tasks_filters_auditor_review_queue(kanban_home):
+    with kb.connect() as conn:
+        t1 = kb.create_task(conn, title="unassigned review", assignee="alice")
+        _set_task_status(conn, t1, "review")
+        t2 = kb.create_task(conn, title="bob review", assignee="alice")
+        _set_task_status(conn, t2, "review")
+        conn.execute("UPDATE tasks SET auditor = ? WHERE id = ?", ("bob", t2))
+        t3 = kb.create_task(conn, title="eve review", assignee="alice")
+        _set_task_status(conn, t3, "review")
+        conn.execute("UPDATE tasks SET auditor = ? WHERE id = ?", ("eve", t3))
+        rows = kb.poll_tasks(conn, role="auditor", profile="bob")
+        ids = {row["id"] for row in rows}
+        assert t1 in ids
+        assert t2 in ids
+        assert t3 not in ids
+
+
+def test_complete_task_needs_audit_routes_to_review(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="editor work", assignee="alice")
+        _set_task_status(conn, t, "running")
+        ok = kb.complete_task(
+            conn,
+            t,
+            result="done",
+            summary="handoff",
+            metadata={"needs_audit": True, "review_auditor": "bob", "review_reason": "verify evidence"},
+        )
+        assert ok is True
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "review"
+        assert getattr(task, "auditor", None) == "bob"

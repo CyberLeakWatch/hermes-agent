@@ -1096,6 +1096,79 @@ def _handle_link(args: dict, **kw) -> str:
         return tool_error(f"kanban_link: {e}")
 
 
+def _handle_request_review(args: dict, **kw) -> str:
+    """Request independent audit: transition running to review."""
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    auditor = args.get("auditor")
+    if auditor:
+        auditor = str(auditor).strip() or None
+    reason = args.get("reason")
+    if reason:
+        reason = redact_sensitive_text(str(reason), force=True)
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            ok = kb.request_review(
+                conn, tid,
+                auditor=auditor, reason=reason,
+                expected_run_id=_worker_run_id(tid),
+            )
+            if not ok:
+                return tool_error(
+                    f"could not request review for {tid} "
+                    f"(not in running status or run_id mismatch)"
+                )
+            return _ok(task_id=tid, status="review", auditor=auditor)
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_request_review: {e}")
+    except Exception as e:
+        logger.exception("kanban_request_review failed")
+        return tool_error(f"kanban_request_review: {e}")
+
+
+def _handle_poll(args: dict, **kw) -> str:
+    """List tasks available for a role (editor or auditor)."""
+    role = args.get("role") or "editor"
+    if role not in ("editor", "auditor"):
+        return tool_error("role must be 'editor' or 'auditor'")
+    profile = args.get("profile")
+    if not profile:
+        profile = os.environ.get("HERMES_PROFILE") or os.environ.get("HERMES_PROFILE_NAME")
+    limit = args.get("limit") or 50
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 50
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            tasks = kb.poll_tasks(
+                conn,
+                role=role,
+                profile=profile if role == "auditor" else None,
+                limit=limit,
+            )
+            return _ok(tasks=tasks, role=role, count=len(tasks))
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_poll: {e}")
+    except Exception as e:
+        logger.exception("kanban_poll failed")
+        return tool_error(f"kanban_poll: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
@@ -1583,6 +1656,82 @@ KANBAN_LINK_SCHEMA = {
 }
 
 
+KANBAN_REQUEST_REVIEW_SCHEMA = {
+    "name": "kanban_request_review",
+    "description": (
+        "Request independent audit for your current task. Transitions "
+        "the task from running to review status, closes your run, and "
+        "optionally designates a specific auditor profile. The auditor "
+        "will be able to discover this task via kanban_poll(role=auditor) "
+        "and claim it with claim_audit. Use this when your work is "
+        "substantively complete but requires independent verification "
+        "before final completion."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "auditor": {
+                "type": "string",
+                "description": (
+                    "Profile name of the designated auditor. When "
+                    "omitted, the task enters review without a named "
+                    "auditor and any available auditor can claim it."
+                ),
+            },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Why review is requested. Shown to the auditor "
+                    "when they claim the task."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": [],
+    },
+}
+
+KANBAN_POLL_SCHEMA = {
+    "name": "kanban_poll",
+    "description": (
+        "List tasks available for a given role. Use role=editor to find "
+        "ready tasks you can pick up as an editor, or role=auditor to "
+        "find review tasks awaiting independent audit. For auditor role, "
+        "pass your profile name to filter to tasks assigned to you or "
+        "unassigned. Returns id, title, status, assignee, auditor, "
+        "priority for each available task."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "role": {
+                "type": "string",
+                "enum": ["editor", "auditor"],
+                "description": "Role to poll for (default: editor).",
+            },
+            "profile": {
+                "type": "string",
+                "description": (
+                    "Your profile name, used for auditor filtering. "
+                    "Defaults to HERMES_PROFILE from the env."
+                ),
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max tasks to return (default: 50).",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": [],
+    },
+}
+
+
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -1666,4 +1815,23 @@ registry.register(
     handler=_handle_link,
     check_fn=_check_kanban_mode,
     emoji="🔗",
+)
+
+
+registry.register(
+    name="kanban_request_review",
+    toolset="kanban",
+    schema=KANBAN_REQUEST_REVIEW_SCHEMA,
+    handler=_handle_request_review,
+    check_fn=_check_kanban_mode,
+    emoji="🔍",
+)
+
+registry.register(
+    name="kanban_poll",
+    toolset="kanban",
+    schema=KANBAN_POLL_SCHEMA,
+    handler=_handle_poll,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="📋",
 )
