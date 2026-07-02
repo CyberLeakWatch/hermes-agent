@@ -7685,7 +7685,14 @@ def _default_spawn(
 
     profile_arg = normalize_profile_name(task.assignee)
 
-    prompt = f"work kanban task {task.id}"
+    prompt = (
+        "You are a Hermes Kanban worker. "
+        f"Your assigned task id is {task.id}. "
+        "First call kanban_show() with no arguments to read the task. "
+        "Do not use the todo/task-list tools as a substitute for Kanban. "
+        "When finished, call kanban_complete(summary=..., metadata=...) or "
+        "kanban_block(reason=...)."
+    )
     env = dict(os.environ)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
@@ -8721,3 +8728,4 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
