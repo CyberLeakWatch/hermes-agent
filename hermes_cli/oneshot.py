@@ -337,6 +337,11 @@ def _run_agent(
     # honour the same merge semantics as interactive CLI and gateway sessions.
     _fb = get_fallback_chain(cfg)
 
+    # Wait for background MCP discovery before AIAgent snapshots tool schemas.
+    # Interactive CLI already does this; oneshot must not race slow MCP servers.
+    from hermes_cli.mcp_startup import wait_for_mcp_discovery
+    wait_for_mcp_discovery()
+
     agent = AIAgent(
         api_key=runtime.get("api_key"),
         base_url=runtime.get("base_url"),
@@ -385,3 +390,4 @@ def _oneshot_clarify_callback(question: str, choices=None) -> str:
         "[oneshot mode: no user available. Make the most reasonable "
         "assumption you can and continue.]"
     )
+

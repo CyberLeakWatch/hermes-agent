@@ -884,6 +884,73 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     assert captured["prompt"] == "recall this"
 
 
+
+def test_oneshot_waits_for_mcp_discovery_before_agent_init(monkeypatch):
+    from hermes_cli.oneshot import _run_agent
+
+    state = {"waited": False}
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            assert state["waited"] is True
+            captured.update(kwargs)
+            self.suppress_status_output = False
+            self.stream_delta_callback = object()
+            self.tool_gen_callback = object()
+
+        def run_conversation(self, prompt, **_kwargs):
+            return {"final_response": "ok", "failed": False, "partial": False}
+
+    def mod(name, **attrs):
+        module = types.ModuleType(name)
+        for key, value in attrs.items():
+            setattr(module, key, value)
+        return module
+
+    monkeypatch.setitem(sys.modules, "run_agent", mod("run_agent", AIAgent=FakeAgent))
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.config",
+        mod("hermes_cli.config", load_config=lambda: {"model": {"default": "m"}}),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.models",
+        mod("hermes_cli.models", detect_provider_for_model=lambda *_args, **_kwargs: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.runtime_provider",
+        mod(
+            "hermes_cli.runtime_provider",
+            resolve_runtime_provider=lambda **_kwargs: {
+                "api_key": "k",
+                "base_url": "u",
+                "provider": "p",
+                "api_mode": "chat_completions",
+                "credential_pool": None,
+            },
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.tools_config",
+        mod("hermes_cli.tools_config", _get_platform_tools=lambda *_args, **_kwargs: {"session_search"}),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.mcp_startup",
+        mod("hermes_cli.mcp_startup", wait_for_mcp_discovery=lambda: state.__setitem__("waited", True)),
+    )
+
+    text, result = _run_agent("recall this")
+    assert text == "ok"
+    assert not result.get("failed")
+    assert state["waited"] is True
+    assert captured["enabled_toolsets"] == ["session_search"]
+
+
 def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):
     captured = {}
     active_path_during_call = None
@@ -1121,3 +1188,4 @@ def test_print_tui_exit_summary_prefers_actual_active_session_file(
     assert seen == ["actual_session"]
     assert "hermes --tui --resume actual_session" in out
     assert "startup_resume" not in out
+
