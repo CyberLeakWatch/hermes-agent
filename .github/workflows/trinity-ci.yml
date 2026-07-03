@@ -31,18 +31,8 @@ jobs:
       - name: Compile kanban focal modules
         run: |
           set -euo pipefail
-          FILES=(
-            hermes_cli/kanban.py
-            hermes_cli/kanban_db.py
-            hermes_cli/kanban_decompose.py
-            hermes_cli/kanban_diagnostics.py
-            hermes_cli/kanban_specify.py
-            hermes_cli/kanban_swarm.py
-            gateway/kanban_watchers.py
-            tools/kanban_tools.py
-          )
           FAIL=0
-          for f in "${{FILES[@]}}"; do
+          for f in hermes_cli/kanban.py hermes_cli/kanban_db.py hermes_cli/kanban_decompose.py hermes_cli/kanban_diagnostics.py hermes_cli/kanban_specify.py hermes_cli/kanban_swarm.py gateway/kanban_watchers.py tools/kanban_tools.py; do
             if [ -f "$f" ]; then
               echo "Compiling $f..."
               python -m py_compile "$f" || { echo "::error::$f failed py_compile"; FAIL=1; }
