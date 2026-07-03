@@ -543,6 +543,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                         help="Your profile name (for auditor filtering)")
     p_poll.add_argument("--limit", type=int, default=50,
                         help="Max tasks to list (default: 50)")
+    p_poll.add_argument("--json", dest="json_output", action="store_true",
+                        help="Emit JSON output")
 
     # --- comment / complete / block / unblock / archive ---
     p_comment = sub.add_parser("comment", help="Append a comment")
