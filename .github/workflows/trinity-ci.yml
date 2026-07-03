@@ -1,0 +1,117 @@
+name: Trinity CI
+
+# Lightweight CI for the hermes-trinity-clean branch.
+# Runs py_compile on kanban focal files + a focused subset of kanban tests.
+
+on:
+  push:
+    branches: [hermes-trinity-clean]
+  pull_request:
+    branches: [hermes-trinity-clean]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trinity-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  py-compile:
+    name: py_compile focal modules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compile kanban focal modules
+        run: |
+          set -euo pipefail
+          FILES=(
+            hermes_cli/kanban.py
+            hermes_cli/kanban_db.py
+            hermes_cli/kanban_decompose.py
+            hermes_cli/kanban_diagnostics.py
+            hermes_cli/kanban_specify.py
+            hermes_cli/kanban_swarm.py
+            gateway/kanban_watchers.py
+            tools/kanban_tools.py
+          )
+          FAIL=0
+          for f in "${{FILES[@]}}"; do
+            if [ -f "$f" ]; then
+              echo "Compiling $f..."
+              python -m py_compile "$f" || { echo "::error::$f failed py_compile"; FAIL=1; }
+            else
+              echo "::warning::$f not found, skipping"
+            fi
+          done
+          exit $FAIL
+
+  kanban-focal-tests:
+    name: Kanban focal tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --locked --python 3.11 --extra all --extra dev
+
+      - name: Run focal kanban tests
+        run: |
+          source .venv/bin/activate
+          python -m pytest -v --tb=short \
+            tests/hermes_cli/test_kanban_core_functionality.py \
+            tests/hermes_cli/test_kanban_db.py \
+            tests/hermes_cli/test_kanban_db_init.py \
+            tests/hermes_cli/test_kanban_cli.py \
+            tests/hermes_cli/test_kanban_boards.py \
+            tests/hermes_cli/test_kanban_decompose.py \
+            tests/hermes_cli/test_kanban_specify.py \
+            tests/hermes_cli/test_kanban_swarm.py \
+            tests/hermes_cli/test_kanban_diagnostics.py \
+            tests/hermes_cli/test_kanban_promote.py \
+            tests/hermes_cli/test_kanban_notify.py \
+            tests/hermes_cli/test_kanban_dispatch_lock.py \
+            tests/plugins/test_kanban_dashboard_plugin.py \
+            tests/tools/test_kanban_tools.py
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
+  trinity-gate:
+    name: Trinity CI gate
+    needs: [py-compile, kanban-focal-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate results
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          echo "$RESULTS" | python3 -c "
+          import json, sys
+          results = json.load(sys.stdin)
+          failed = [r for r in results if r == 'failure']
+          if failed:
+              print(f'::error::{len(failed)} job(s) failed')
+              sys.exit(1)
+          print('Trinity CI: all checks passed')
+          "
