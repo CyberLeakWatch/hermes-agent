@@ -86,9 +86,64 @@ jobs:
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
 
+
+  review-handoff-smoke:
+    name: Review handoff smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --locked --python 3.11 --extra dev
+
+      - name: Import review handoff modules
+        run: |
+          source .venv/bin/activate
+          python - <<'PY'
+          import hermes_cli.kanban as cli
+          import tools.kanban_tools as kt
+
+          assert hasattr(cli, "_cmd_review")
+          assert hasattr(cli, "_cmd_poll")
+          assert hasattr(kt, "_handle_request_review")
+          assert hasattr(kt, "_handle_poll")
+          print("imports_ok")
+          PY
+
+      - name: Run review handoff CLI smoke
+        run: |
+          source .venv/bin/activate
+          export HERMES_HOME="$(mktemp -d)"
+          export HERMES_KANBAN_HOME="$(mktemp -d)"
+
+          create_json="$(hermes kanban create "CI review handoff" --assignee default --json)"
+          task_id="$(python -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<< "$create_json")"
+
+          hermes kanban claim "$task_id"
+          hermes kanban review "$task_id" --auditor default --reason "ci smoke"
+          hermes kanban poll --role auditor --profile default --limit 10
+          hermes kanban poll --role auditor --profile default --limit 10 --json \
+            | python -c 'import json,sys; rows=json.load(sys.stdin); assert any(r["status"]=="review" for r in rows)'
+          hermes kanban claim-audit "$task_id"
+          hermes kanban show "$task_id" | tee show.txt
+          grep -q "review_requested" show.txt
+          grep -q "audit_claimed" show.txt
+
   trinity-gate:
     name: Trinity CI gate
-    needs: [py-compile, kanban-focal-tests]
+    needs: [py-compile, kanban-focal-tests, review-handoff-smoke]
     if: always()
     runs-on: ubuntu-latest
     steps:
